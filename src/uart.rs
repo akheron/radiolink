@@ -12,8 +12,6 @@ use TxState::*;
 pub struct Uart {
     uart0: UART0,
     tx_state: TxState,
-    tx_queue: Queue<u8, 1024>, // TODO: these can probably be much smaller, do measurements
-    rx_queue: Queue<u8, 1024>,
 }
 
 impl Uart {
@@ -21,8 +19,6 @@ impl Uart {
         Self {
             uart0,
             tx_state: Idle,
-            tx_queue: Queue::new(),
-            rx_queue: Queue::new(),
         }
     }
 
@@ -32,19 +28,29 @@ impl Uart {
 
         self.uart0.pseltxd.write(|w| unsafe { w.bits(tx_pin) });
         self.uart0.pselrxd.write(|w| unsafe { w.bits(rx_pin) });
-        self.uart0.baudrate.write(|w| w.baudrate().baud115200());
+        self.uart0.baudrate.write(|w| w.baudrate().baud9600());
         self.uart0.enable.write(|w| w.enable().enabled());
 
         self.uart0.tasks_startrx.write(|w| unsafe { w.bits(1) });
+        self.uart0.tasks_starttx.write(|w| unsafe { w.bits(1) });
+
         debug!("UART initialized");
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(
+        &mut self,
+        _now: u32,
+        tx_queue: &mut Queue<u8, 1024>,
+        rx_queue: &mut Queue<u8, 1024>,
+    ) {
         self.tx_state = match self.tx_state {
             Idle => {
-                if let Some(c) = self.tx_queue.dequeue() {
-                    debug!("uart - Sending {:x}", c);
-                    self.uart0.tasks_starttx.write(|w| unsafe { w.bits(1) });
+                if let Some(c) = tx_queue.dequeue() {
+                    debug!(
+                        "uart - first write {=u8:x}, queue size {=usize}",
+                        c,
+                        tx_queue.len()
+                    );
                     self.uart0.txd.write(|w| unsafe { w.txd().bits(c) });
                     Tx
                 } else {
@@ -53,41 +59,29 @@ impl Uart {
             }
             Tx => {
                 if self.uart0.events_txdrdy.read().bits() != 0 {
-                    debug!("uart - Send finished");
-                    if let Some(c) = self.tx_queue.dequeue() {
+                    if let Some(c) = tx_queue.dequeue() {
                         debug!(
-                            "uart - Sending {:x} right away, queue size {}",
+                            "uart - write {=u8:x}, queue size {=usize}",
                             c,
-                            self.tx_queue.len()
+                            tx_queue.len()
                         );
+                        self.uart0.events_txdrdy.write(|w| unsafe { w.bits(0) });
                         self.uart0.txd.write(|w| unsafe { w.txd().bits(c) });
-                        Tx
-                    } else {
-                        self.uart0.tasks_stoptx.write(|w| unsafe { w.bits(1) });
-                        debug!("uart - Nothing to send");
-                        Idle
                     }
-                } else {
-                    Tx
                 }
+                Tx
             }
         };
 
-        // Receive all available bytes
         while self.uart0.events_rxdrdy.read().bits() != 0 {
             self.uart0.events_rxdrdy.write(|w| unsafe { w.bits(0) });
-            self.rx_queue
-                .enqueue(self.uart0.rxd.read().bits() as u8)
-                .unwrap();
-            debug!("uart - Received {:x}", self.rx_queue.peek().unwrap());
+            let byte = self.uart0.rxd.read().bits() as u8;
+            rx_queue.enqueue(byte).unwrap();
+            debug!(
+                "uart - read {=u8:x}, queue size {=usize}",
+                byte,
+                rx_queue.len()
+            );
         }
-    }
-
-    pub fn read(&mut self) -> Option<u8> {
-        self.rx_queue.dequeue()
-    }
-
-    pub fn write(&mut self, c: u8) {
-        self.tx_queue.enqueue(c).unwrap();
     }
 }

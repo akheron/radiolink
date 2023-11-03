@@ -16,33 +16,186 @@ enum RadioState {
     TxDisable,
 }
 
+#[derive(Clone, Copy)]
 enum RxState {
     Initial,
-    PendingAck { id: u8 },
-    LastAck { id: u8 },
+    NeedsAck { id: u8 },
+    Acked { id: u8 },
 }
 
+impl RxState {
+    fn debug(&self) {
+        match self {
+            RxState::Initial => {
+                debug!("radio - rx_state: Initial",);
+            }
+            RxState::NeedsAck { id } => {
+                debug!("radio - rx_state: NeedsAck id={=u8}", id);
+            }
+            RxState::Acked { id } => {
+                debug!("radio - rx_state: Acked id={=u8}", id);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum TxState {
     Idle,
-    WaitingForAck {
-        id: u8,
-        data_len: u8,
-        data: [u8; MAX_DATA_SIZE],
+    Sent {
+        packet_data: PacketData,
+        tx_count: u32,
+        since: u32,
     },
 }
 
 impl TxState {
-    fn waiting_for_ack(id: u8, data: &[u8]) -> Self {
-        let mut data_len = data.len();
-        if data_len > MAX_DATA_SIZE {
-            data_len = MAX_DATA_SIZE;
+    fn debug(&self) {
+        match self {
+            TxState::Idle => {
+                debug!("radio - tx_state: Idle",);
+            }
+            TxState::Sent {
+                packet_data: PacketData { id, .. },
+                tx_count,
+                since,
+            } => {
+                debug!(
+                    "radio - tx_state: Sent id={=u8} tx_count={=u32} since={=u32}",
+                    id, tx_count, since
+                );
+            }
         }
-        let mut packet_data = [0; MAX_DATA_SIZE];
-        packet_data[0..data_len].copy_from_slice(data);
-        Self::WaitingForAck {
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PacketData {
+    id: u8,
+    data_len: u8,
+    data: [u8; MAX_DATA_SIZE],
+}
+
+impl PacketData {
+    fn from_queue(id: u8, queue: &mut Queue<u8, 1024>) -> Self {
+        let mut data = [0; MAX_DATA_SIZE];
+        let mut len = 0;
+        while len < MAX_DATA_SIZE && !queue.is_empty() {
+            data[len] = queue.dequeue().unwrap();
+            len += 1;
+        }
+        Self {
             id,
-            data_len: data_len as u8,
-            data: packet_data,
+            data_len: len as u8,
+            data,
+        }
+    }
+
+    fn iter(&self) -> core::slice::Iter<'_, u8> {
+        self.data[..self.data_len as usize].iter()
+    }
+}
+
+enum Packet {
+    Ack(u8),
+    Data(PacketData),
+    Both(u8, PacketData),
+}
+
+impl Packet {
+    fn read(source: &[u8]) -> Option<Self> {
+        let len = source[0];
+        if (len as usize) < MIN_PACKET_SIZE || (len as usize) > MAX_PACKET_SIZE {
+            None
+        } else {
+            match source[1] {
+                b'A' => Some(Self::Ack(source[2])),
+                b'D' => {
+                    let mut data = [0; MAX_DATA_SIZE];
+                    data[..(len as usize - 3)].copy_from_slice(&source[3..(len as usize)]);
+                    Some(Self::Data(PacketData {
+                        id: source[2],
+                        data_len: len - 3,
+                        data,
+                    }))
+                }
+                b'X' => {
+                    let mut data = [0; MAX_DATA_SIZE];
+                    data[..(len as usize - 4)].copy_from_slice(&source[4..(len as usize)]);
+                    Some(Self::Both(
+                        source[2],
+                        PacketData {
+                            id: source[3],
+                            data_len: len - 4,
+                            data,
+                        },
+                    ))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn write(&self, target: &mut [u8]) {
+        match self {
+            Packet::Ack(ack) => {
+                target[0] = 3;
+                target[1] = b'A';
+                target[2] = *ack;
+            }
+            Packet::Data(PacketData { id, data_len, data }) => {
+                target[0] = data_len + 3;
+                target[1] = b'D';
+                target[2] = *id;
+                target[3..(*data_len as usize + 3)].copy_from_slice(&data[0..*data_len as usize]);
+            }
+            Packet::Both(ack_id, PacketData { id, data_len, data }) => {
+                target[0] = data_len + 4;
+                target[1] = b'X';
+                target[2] = *ack_id;
+                target[3] = *id;
+                target[4..(*data_len as usize + 4)].copy_from_slice(&data[0..*data_len as usize]);
+            }
+        }
+    }
+
+    fn debug_assembled(&self) {
+        match self {
+            Packet::Ack(ack) => {
+                debug!("radio - assembled packet: A ack={=u8}", ack);
+            }
+            Packet::Data(PacketData { id, data_len, .. }) => {
+                debug!(
+                    "radio - assembled packet: D id={=u8} data_len={=u8}",
+                    id, data_len
+                );
+            }
+            Packet::Both(ack, PacketData { id, data_len, .. }) => {
+                debug!(
+                    "radio - assembled packet: X ack={=u8} id={=u8} data_len={=u8}",
+                    ack, id, data_len
+                );
+            }
+        }
+    }
+
+    fn debug_received(&self) {
+        match self {
+            Packet::Ack(ack) => {
+                debug!("radio - received packet: A ack={=u8}", ack);
+            }
+            Packet::Data(PacketData { id, data_len, .. }) => {
+                debug!(
+                    "radio - received packet: D id={=u8} data_len={=u8}",
+                    id, data_len
+                );
+            }
+            Packet::Both(ack, PacketData { id, data_len, .. }) => {
+                debug!(
+                    "radio - received packet: X ack={=u8} id={=u8} data_len={=u8}",
+                    ack, id, data_len
+                );
+            }
         }
     }
 }
@@ -54,8 +207,6 @@ pub struct Radio {
     radio_state: RadioState,
     rx_state: RxState,
     tx_state: TxState,
-    tx_queue: Queue<u8, 1024>,
-    rx_queue: Queue<u8, 1024>,
 }
 
 impl Radio {
@@ -67,8 +218,6 @@ impl Radio {
             radio_state: RadioState::Uninitialized,
             rx_state: RxState::Initial,
             tx_state: TxState::Idle,
-            tx_queue: Queue::new(),
-            rx_queue: Queue::new(),
         }
     }
 
@@ -124,20 +273,36 @@ impl Radio {
         debug!("Radio initialized");
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(
+        &mut self,
+        now: u32,
+        tx_queue: &mut Queue<u8, 1024>,
+        rx_queue: &mut Queue<u8, 1024>,
+    ) {
         self.radio_state = match self.radio_state {
             RadioState::Uninitialized => RadioState::Uninitialized,
             RadioState::RxIdle => {
                 if self.radio.events_address.read().bits() != 0 {
-                    debug!("radio - receiving");
+                    // debug!("radio - receiving at {=u32}", now);
                     self.radio.events_address.write(|w| unsafe { w.bits(0) });
                     RadioState::Rx
-                } else if self.assemble_packet() {
-                    debug!("radio - disable rx");
-                    self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
-                    RadioState::RxDisable
                 } else {
-                    RadioState::RxIdle
+                    let (tx_packet, rx_state, tx_state) = self.assemble_packet(now, tx_queue);
+                    self.rx_state = rx_state;
+                    self.tx_state = tx_state;
+
+                    if let Some(packet) = tx_packet {
+                        packet.debug_assembled();
+                        rx_state.debug();
+                        tx_state.debug();
+                        packet.write(&mut self.packet);
+
+                        // debug!("radio - disable rx at {=u32}", now);
+                        self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
+                        RadioState::RxDisable
+                    } else {
+                        RadioState::RxIdle
+                    }
                 }
             }
             RadioState::Rx => {
@@ -145,10 +310,38 @@ impl Radio {
                     self.radio.events_end.write(|w| unsafe { w.bits(0) });
                     if self.radio.crcstatus.read().crcstatus().is_crcok() {
                         // CRC ok
-                        self.disassemble_packet();
+                        // debug!("radio - crc ok at {=u32}", now);
+                        if let Some(packet) = Packet::read(&self.packet) {
+                            match packet {
+                                Packet::Ack(ack) => {
+                                    // debug!("radio - received ack: {=u8}", ack);
+                                    self.handle_rx_ack(ack);
+                                }
+                                Packet::Data(packet_data) => {
+                                    // debug!("radio - received data: {=u8}", packet_data.id);
+                                    self.handle_rx_data(packet_data, rx_queue);
+                                }
+                                Packet::Both(ack, packet_data) => {
+                                    // debug!("radio - received ack and data: {=u8}", packet_data.id);
+                                    self.handle_rx_ack(ack);
+                                    self.handle_rx_data(packet_data, rx_queue);
+                                }
+                            }
+                            packet.debug_received();
+                            self.rx_state.debug();
+                            self.tx_state.debug();
+                        } else {
+                            debug!(
+                                "radio - received malformed packet {=u8} {=u8} {=u8} {=u8}",
+                                self.packet[0], self.packet[1], self.packet[2], self.packet[3]
+                            );
+                        }
+                    } else {
+                        // CRC error
+                        debug!("radio - crc error");
                     }
                     self.radio.tasks_start.write(|w| unsafe { w.bits(1) });
-                    debug!("radio - receive done - restarted rx");
+                    // debug!("radio - receive done - restarted rx at {=u32}", now);
                     RadioState::RxIdle
                 } else {
                     RadioState::Rx
@@ -156,7 +349,7 @@ impl Radio {
             }
             RadioState::RxDisable => {
                 if self.radio.events_disabled.read().bits() != 0 {
-                    debug!("radio - rx disabled");
+                    // debug!("radio - rx disabled at {=u32}", now);
                     self.radio.events_disabled.write(|w| unsafe { w.bits(0) });
                     self.radio.tasks_txen.write(|w| unsafe { w.bits(1) });
                     RadioState::Tx
@@ -166,7 +359,7 @@ impl Radio {
             }
             RadioState::Tx => {
                 if self.radio.events_end.read().bits() != 0 {
-                    debug!("radio - tx done");
+                    // debug!("radio - tx done at {=u32}", now);
                     self.radio.events_address.write(|w| unsafe { w.bits(0) });
                     self.radio.events_end.write(|w| unsafe { w.bits(0) });
                     self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
@@ -177,7 +370,7 @@ impl Radio {
             }
             RadioState::TxDisable => {
                 if self.radio.events_disabled.read().bits() != 0 {
-                    debug!("radio - tx disabled");
+                    // debug!("radio - tx disabled at {=u32}", now);
                     self.radio.events_disabled.write(|w| unsafe { w.bits(0) });
                     self.radio.tasks_rxen.write(|w| unsafe { w.bits(1) });
                     RadioState::RxIdle
@@ -188,118 +381,154 @@ impl Radio {
         };
     }
 
-    pub fn write(&mut self, byte: u8) {
-        self.tx_queue.enqueue(byte).unwrap();
-    }
-
-    pub fn read(&mut self) -> Option<u8> {
-        self.rx_queue.dequeue()
+    fn get_packet_id(&mut self) -> u8 {
+        let id = self.next_packet_id;
+        self.next_packet_id = self.next_packet_id.wrapping_add(1);
+        id
     }
 
     fn handle_rx_ack(&mut self, ack: u8) {
-        if let TxState::WaitingForAck { id, .. } = self.tx_state {
+        if let TxState::Sent {
+            packet_data: PacketData { id, .. },
+            ..
+        } = self.tx_state
+        {
             if id == ack {
                 self.tx_state = TxState::Idle;
             }
         }
     }
 
-    fn handle_rx_data(&mut self, id: u8, start: usize, end: usize) {
+    fn handle_rx_data(&mut self, packet_data: PacketData, rx_queue: &mut Queue<u8, 1024>) {
         match self.rx_state {
             RxState::Initial => {
-                // This is the first received data
-                for &byte in self.packet[start..end].iter() {
-                    self.rx_queue.enqueue(byte).unwrap();
+                // This is the first received data packet
+                for &byte in packet_data.iter() {
+                    rx_queue.enqueue(byte).unwrap();
                 }
-                self.rx_state = RxState::PendingAck { id };
+                self.rx_state = RxState::NeedsAck { id: packet_data.id };
             }
-            RxState::LastAck { id: last_acked_id } => {
-                if id != last_acked_id {
-                    for &byte in self.packet[start..end].iter() {
-                        self.rx_queue.enqueue(byte).unwrap();
+            RxState::Acked { id: last_acked_id } => {
+                if packet_data.id != last_acked_id {
+                    // Write data to rx queue only if it's a new packet
+                    for &byte in packet_data.iter() {
+                        rx_queue.enqueue(byte).unwrap();
                     }
-                    self.rx_state = RxState::PendingAck { id };
+                } else {
+                    debug!(
+                        "radio - received an already acked packet {=u8}",
+                        packet_data.id
+                    );
                 }
+                self.rx_state = RxState::NeedsAck { id: packet_data.id };
             }
-            RxState::PendingAck { .. } => {
+            RxState::NeedsAck { .. } => {
                 // Got a new packet before sending an ack => must be a retransmit
+                debug!(
+                    "radio - received a packet before sending ack {=u8}",
+                    packet_data.id
+                );
             }
         }
     }
 
-    fn disassemble_packet(&mut self) {
-        let len = self.packet[0];
-        if (len as usize) < MIN_PACKET_SIZE || (len as usize) > MAX_PACKET_SIZE {
-            return;
-        }
-
-        let packet_type = self.packet[1];
-        if packet_type == b'D' {
-            debug!("Disassembled packet: {} D {}", len, self.packet[2]);
-            self.handle_rx_data(self.packet[2], 3, len as usize);
-        } else if packet_type == b'A' {
-            debug!("Disassembled packet: {} A {}", len, self.packet[2]);
-            self.handle_rx_ack(self.packet[2]);
-        } else if packet_type == b'X' {
-            debug!(
-                "Disassembled packet: {} X {} {}",
-                len, self.packet[2], self.packet[3]
-            );
-            self.handle_rx_ack(self.packet[2]);
-            self.handle_rx_data(self.packet[3], 4, len as usize);
-        } else {
-            debug!("Unknown packet type: {}", packet_type);
-        }
-    }
-
-    fn assemble_packet(&mut self) -> bool {
-        match (&self.rx_state, &self.tx_state) {
-            (_, TxState::WaitingForAck { .. }) => {
-                // Waiting for ack to the last tx packet => don't send more
-                false
+    fn assemble_packet(
+        &mut self,
+        now: u32,
+        tx_queue: &mut Queue<u8, 1024>,
+    ) -> (Option<Packet>, RxState, TxState) {
+        match (self.rx_state, self.tx_state) {
+            (
+                RxState::NeedsAck { id: ack_id },
+                TxState::Sent {
+                    packet_data,
+                    tx_count,
+                    ..
+                },
+            ) => {
+                // Should ack the last rx packet, and still waiting for tx ack =>
+                // send ack and retransmit last data
+                (
+                    Some(Packet::Both(ack_id, packet_data)),
+                    RxState::Acked { id: ack_id },
+                    TxState::Sent {
+                        tx_count: tx_count + 1,
+                        since: now,
+                        packet_data,
+                    },
+                )
             }
-            (&RxState::PendingAck { id: ack_id }, _) if !self.tx_queue.is_empty() => {
-                // Waiting to ack the last rx packet and has data to transmit => send ack and data
-                self.packet[1] = b'X';
-                self.packet[2] = ack_id;
-                self.packet[3] = self.next_packet_id;
-                self.next_packet_id = self.next_packet_id.wrapping_add(1);
-                let mut len = 4;
-                while len < MAX_PACKET_SIZE && !self.tx_queue.is_empty() {
-                    self.packet[len] = self.tx_queue.dequeue().unwrap();
-                    len += 1;
+            (
+                rx_state,
+                tx_state @ TxState::Sent {
+                    packet_data,
+                    tx_count,
+                    since,
+                },
+            ) => {
+                // Waiting for ack to the last tx packet => retransmit if enough time has passed (with exponential backoff).
+                // The (now % 3) term adds some randomness to the retransmit interval.
+                if now - since > 2 + 2u32.pow(tx_count) + (now % 3) {
+                    if tx_count <= 6 {
+                        (
+                            Some(Packet::Data(packet_data)),
+                            rx_state,
+                            TxState::Sent {
+                                tx_count: tx_count + 1,
+                                since: now,
+                                packet_data,
+                            },
+                        )
+                    } else {
+                        debug!(
+                            "radio - no ack received for {=u8} after {=u32} transmits, giving up",
+                            packet_data.id, tx_count
+                        );
+                        (None, rx_state, TxState::Idle)
+                    }
+                } else {
+                    (None, rx_state, tx_state)
                 }
-                self.packet[0] = len as u8;
-                self.rx_state = RxState::LastAck { id: ack_id };
-                self.tx_state = TxState::waiting_for_ack(self.packet[3], &self.packet[4..len]);
-                debug!("Assembled packet: {} X {} {}", len, ack_id, self.packet[3]);
-                true
             }
-            (&RxState::PendingAck { id }, _) if self.tx_queue.is_empty() => {
-                // Waiting to ack the last rx packet and no data to transmit => send ack
-                self.packet[0] = 3;
-                self.packet[1] = b'A';
-                self.packet[2] = id;
-                self.rx_state = RxState::LastAck { id };
-                debug!("Assembled packet: 3 A {}", id);
-                true
-            }
-            _ if !self.tx_queue.is_empty() => {
-                // Has data to transmit => send data
-                self.packet[1] = b'D';
-                self.packet[2] = self.next_packet_id;
-                self.next_packet_id = self.next_packet_id.wrapping_add(1);
-                let mut len = 3;
-                while len < MAX_PACKET_SIZE && !self.tx_queue.is_empty() {
-                    self.packet[len] = self.tx_queue.dequeue().unwrap();
-                    len += 1;
+            (RxState::NeedsAck { id: ack_id }, TxState::Idle) => {
+                if !tx_queue.is_empty() {
+                    // Should ack the last rx packet and has data to transmit => send ack and data
+                    let packet_data = PacketData::from_queue(self.get_packet_id(), tx_queue);
+                    (
+                        Some(Packet::Both(ack_id, packet_data)),
+                        RxState::Acked { id: ack_id },
+                        TxState::Sent {
+                            tx_count: 1,
+                            since: now,
+                            packet_data,
+                        },
+                    )
+                } else {
+                    // Should ack the last rx packet and no data to transmit => send ack
+                    (
+                        Some(Packet::Ack(ack_id)),
+                        RxState::Acked { id: ack_id },
+                        TxState::Idle,
+                    )
                 }
-                self.packet[0] = len as u8;
-                self.tx_state = TxState::waiting_for_ack(self.packet[2], &self.packet[3..len]);
-                debug!("Assembled packet: {} D {}", len, self.packet[2]);
-                true
             }
-            _ => false,
+            (rx_state, TxState::Idle) => {
+                if !tx_queue.is_empty() {
+                    // Data to transmit => send data
+                    let packet_data = PacketData::from_queue(self.get_packet_id(), tx_queue);
+                    (
+                        Some(Packet::Data(packet_data)),
+                        rx_state,
+                        TxState::Sent {
+                            tx_count: 1,
+                            since: now,
+                            packet_data,
+                        },
+                    )
+                } else {
+                    (None, rx_state, TxState::Idle)
+                }
+            }
         }
     }
 }
