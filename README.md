@@ -2,10 +2,10 @@
 
 This is a research project into embedded development.
 
-The goal is to create a simple serial link between two [BBC micro:bit](https://microbit.org/) devices over 2.4 GHz
+The goal is to create a simple serial link between two [BBC micro:bit v1](https://microbit.org/) devices over 2.4 GHz
 radio. This would enable for example a PPP connection between two locations over a distance of a few tens of metres.
 
-micro:bit has an nRF51822 microcontroller, which features UART and a pretty low level 2.4 GHz radio interface.
+micro:bit v1 has an nRF51822 microcontroller, which features UART and a 2.4 GHz radio with a pretty low-level API.
 Here's a diagram of the setup:
 ```
 client <------> micro:bit ~~~~~~~ micro:bit <------> client
@@ -19,8 +19,24 @@ The current iteration uses Rust, but is still very much a work in progress, most
 
 ## Development
 
-Install some helpers: `cargo install probe-rs flip-link`
+Install prerequisites
 
-Build and flash the firmware: `cargo run --release --target thumbv6m-none-eabi`
+```
+rustup target add thumbv6m-none-eabi
+cargo install flip-link
+cargo install probe-rs --features cli
+```
+
+Build and flash the firmware:
+
+```
+cargo run
+```
+
+To receive debug logging from the device, set the `DEFMT_LOG` environment variable:
+
+```
+DEFMT_LOG=debug cargo run
+```
 
 Currently uses pins 0 and 1 of the edge connector for UART RX and TX.
