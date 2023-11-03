@@ -7,6 +7,7 @@ mod uart;
 use crate::radio::Radio;
 use cortex_m_rt::entry;
 use defmt_rtt as _;
+use heapless::spsc::Queue;
 use microbit::Peripherals;
 use panic_halt as _;
 
@@ -23,15 +24,11 @@ fn main() -> ! {
     let mut radio = Radio::new(p.RADIO);
     radio.init(&p.CLOCK);
 
-    loop {
-        uart.tick();
-        radio.tick();
+    let mut uart_to_radio: Queue<u8, 1024> = Queue::new();
+    let mut radio_to_uart: Queue<u8, 1024> = Queue::new();
 
-        if let Some(c) = uart.read() {
-            radio.write(c);
-        }
-        if let Some(msg) = radio.read() {
-            uart.write(msg);
-        }
+    loop {
+        uart.tick(&mut radio_to_uart, &mut uart_to_radio);
+        radio.tick(&mut uart_to_radio, &mut radio_to_uart);
     }
 }

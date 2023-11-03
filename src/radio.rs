@@ -54,8 +54,6 @@ pub struct Radio {
     radio_state: RadioState,
     rx_state: RxState,
     tx_state: TxState,
-    tx_queue: Queue<u8, 1024>,
-    rx_queue: Queue<u8, 1024>,
 }
 
 impl Radio {
@@ -67,8 +65,6 @@ impl Radio {
             radio_state: RadioState::Uninitialized,
             rx_state: RxState::Initial,
             tx_state: TxState::Idle,
-            tx_queue: Queue::new(),
-            rx_queue: Queue::new(),
         }
     }
 
@@ -124,7 +120,7 @@ impl Radio {
         debug!("Radio initialized");
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self, tx_queue: &mut Queue<u8, 1024>, rx_queue: &mut Queue<u8, 1024>) {
         self.radio_state = match self.radio_state {
             RadioState::Uninitialized => RadioState::Uninitialized,
             RadioState::RxIdle => {
@@ -132,7 +128,7 @@ impl Radio {
                     debug!("radio - receiving");
                     self.radio.events_address.write(|w| unsafe { w.bits(0) });
                     RadioState::Rx
-                } else if self.assemble_packet() {
+                } else if self.assemble_packet(tx_queue) {
                     debug!("radio - disable rx");
                     self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
                     RadioState::RxDisable
@@ -145,7 +141,7 @@ impl Radio {
                     self.radio.events_end.write(|w| unsafe { w.bits(0) });
                     if self.radio.crcstatus.read().crcstatus().is_crcok() {
                         // CRC ok
-                        self.disassemble_packet();
+                        self.disassemble_packet(rx_queue);
                     }
                     self.radio.tasks_start.write(|w| unsafe { w.bits(1) });
                     debug!("radio - receive done - restarted rx");
@@ -188,14 +184,6 @@ impl Radio {
         };
     }
 
-    pub fn write(&mut self, byte: u8) {
-        self.tx_queue.enqueue(byte).unwrap();
-    }
-
-    pub fn read(&mut self) -> Option<u8> {
-        self.rx_queue.dequeue()
-    }
-
     fn handle_rx_ack(&mut self, ack: u8) {
         if let TxState::WaitingForAck { id, .. } = self.tx_state {
             if id == ack {
@@ -204,19 +192,19 @@ impl Radio {
         }
     }
 
-    fn handle_rx_data(&mut self, id: u8, start: usize, end: usize) {
+    fn handle_rx_data(&mut self, rx_queue: &mut Queue<u8, 1024>, id: u8, start: usize, end: usize) {
         match self.rx_state {
             RxState::Initial => {
                 // This is the first received data
                 for &byte in self.packet[start..end].iter() {
-                    self.rx_queue.enqueue(byte).unwrap();
+                    rx_queue.enqueue(byte).unwrap();
                 }
                 self.rx_state = RxState::PendingAck { id };
             }
             RxState::LastAck { id: last_acked_id } => {
                 if id != last_acked_id {
                     for &byte in self.packet[start..end].iter() {
-                        self.rx_queue.enqueue(byte).unwrap();
+                        rx_queue.enqueue(byte).unwrap();
                     }
                     self.rx_state = RxState::PendingAck { id };
                 }
@@ -227,7 +215,7 @@ impl Radio {
         }
     }
 
-    fn disassemble_packet(&mut self) {
+    fn disassemble_packet(&mut self, rx_queue: &mut Queue<u8, 1024>) {
         let len = self.packet[0];
         if (len as usize) < MIN_PACKET_SIZE || (len as usize) > MAX_PACKET_SIZE {
             return;
@@ -235,68 +223,80 @@ impl Radio {
 
         let packet_type = self.packet[1];
         if packet_type == b'D' {
-            debug!("Disassembled packet: {} D {}", len, self.packet[2]);
-            self.handle_rx_data(self.packet[2], 3, len as usize);
+            debug!(
+                "radio - disassembled packet: {=u8} D {=u8}",
+                len, self.packet[2]
+            );
+            self.handle_rx_data(rx_queue, self.packet[2], 3, len as usize);
         } else if packet_type == b'A' {
-            debug!("Disassembled packet: {} A {}", len, self.packet[2]);
+            debug!(
+                "radio - disassembled packet: {=u8} A {=u8}",
+                len, self.packet[2]
+            );
             self.handle_rx_ack(self.packet[2]);
         } else if packet_type == b'X' {
             debug!(
-                "Disassembled packet: {} X {} {}",
+                "radio - disassembled packet: {=u8} X {=u8} {=u8}",
                 len, self.packet[2], self.packet[3]
             );
             self.handle_rx_ack(self.packet[2]);
-            self.handle_rx_data(self.packet[3], 4, len as usize);
+            self.handle_rx_data(rx_queue, self.packet[3], 4, len as usize);
         } else {
-            debug!("Unknown packet type: {}", packet_type);
+            debug!("radio - unknown packet type: {=u8}", packet_type);
         }
     }
 
-    fn assemble_packet(&mut self) -> bool {
+    fn assemble_packet(&mut self, tx_queue: &mut Queue<u8, 1024>) -> bool {
         match (&self.rx_state, &self.tx_state) {
             (_, TxState::WaitingForAck { .. }) => {
                 // Waiting for ack to the last tx packet => don't send more
                 false
             }
-            (&RxState::PendingAck { id: ack_id }, _) if !self.tx_queue.is_empty() => {
+            (&RxState::PendingAck { id: ack_id }, _) if !tx_queue.is_empty() => {
                 // Waiting to ack the last rx packet and has data to transmit => send ack and data
                 self.packet[1] = b'X';
                 self.packet[2] = ack_id;
                 self.packet[3] = self.next_packet_id;
                 self.next_packet_id = self.next_packet_id.wrapping_add(1);
                 let mut len = 4;
-                while len < MAX_PACKET_SIZE && !self.tx_queue.is_empty() {
-                    self.packet[len] = self.tx_queue.dequeue().unwrap();
+                while len < MAX_PACKET_SIZE && !tx_queue.is_empty() {
+                    self.packet[len] = tx_queue.dequeue().unwrap();
                     len += 1;
                 }
                 self.packet[0] = len as u8;
                 self.rx_state = RxState::LastAck { id: ack_id };
                 self.tx_state = TxState::waiting_for_ack(self.packet[3], &self.packet[4..len]);
-                debug!("Assembled packet: {} X {} {}", len, ack_id, self.packet[3]);
+                debug!(
+                    "radio - assembled packet: {=u8} X {=u8} {=u8}",
+                    len as u8, ack_id, self.packet[3]
+                );
                 true
             }
-            (&RxState::PendingAck { id }, _) if self.tx_queue.is_empty() => {
+            (&RxState::PendingAck { id }, _) if tx_queue.is_empty() => {
                 // Waiting to ack the last rx packet and no data to transmit => send ack
                 self.packet[0] = 3;
                 self.packet[1] = b'A';
                 self.packet[2] = id;
                 self.rx_state = RxState::LastAck { id };
-                debug!("Assembled packet: 3 A {}", id);
+                debug!("radio - assembled packet: 3 A {=u8}", id);
                 true
             }
-            _ if !self.tx_queue.is_empty() => {
+            _ if !tx_queue.is_empty() => {
                 // Has data to transmit => send data
                 self.packet[1] = b'D';
                 self.packet[2] = self.next_packet_id;
                 self.next_packet_id = self.next_packet_id.wrapping_add(1);
                 let mut len = 3;
-                while len < MAX_PACKET_SIZE && !self.tx_queue.is_empty() {
-                    self.packet[len] = self.tx_queue.dequeue().unwrap();
+                while len < MAX_PACKET_SIZE && !tx_queue.is_empty() {
+                    self.packet[len] = tx_queue.dequeue().unwrap();
                     len += 1;
                 }
                 self.packet[0] = len as u8;
                 self.tx_state = TxState::waiting_for_ack(self.packet[2], &self.packet[3..len]);
-                debug!("Assembled packet: {} D {}", len, self.packet[2]);
+                debug!(
+                    "radio - assembled packet: {=u8} D {=u8}",
+                    len as u8, self.packet[2]
+                );
                 true
             }
             _ => false,
