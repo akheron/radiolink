@@ -463,7 +463,8 @@ impl Radio {
             ) => {
                 // Waiting for ack to the last tx packet => retransmit if enough time has passed (with exponential backoff).
                 // The (now % 3) term adds some randomness to the retransmit interval.
-                if now - since > 2 + 2u32.pow(tx_count) + (now % 3) {
+                // if now - since > 2 + 2u32.pow(tx_count) + (now % 3) {
+                if now - since > 2 + (now % 89) / 3 {
                     if tx_count <= 6 {
                         (
                             // Re-send ack too, because they might be waiting for it
