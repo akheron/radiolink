@@ -1,7 +1,7 @@
 const XON: u8 = 0x11;
 const XOFF: u8 = 0x13;
 
-const QUEUE_SIZE: usize = 1024;
+const QUEUE_SIZE: usize = 4096;
 
 pub struct Queue {
     queue: heapless::spsc::Queue<u8, QUEUE_SIZE>,
@@ -49,10 +49,10 @@ impl Queue {
 
     /// Request flow control by sending XON/XOFF to the target queue if needed
     pub fn flow_control(&mut self, target: &mut Queue) {
-        if self.queue.len() > QUEUE_SIZE / 2 && !self.xoff_on {
+        if self.queue.len() > QUEUE_SIZE / 8 * 7 && !self.xoff_on {
             self.xoff_on = true;
             target.control = Some(XOFF);
-        } else if self.xoff_on && self.queue.len() < QUEUE_SIZE / 4 {
+        } else if self.xoff_on && self.queue.len() < QUEUE_SIZE / 8 * 6 {
             self.xoff_on = false;
             target.control = Some(XON);
         }
