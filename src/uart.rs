@@ -41,11 +41,11 @@ impl Uart {
         self.tx_state = match self.tx_state {
             Idle => {
                 if let Some(c) = tx_queue.dequeue() {
-                    debug!(
-                        "uart - first write {=u8:x}, queue size {=usize}",
-                        c,
-                        tx_queue.len()
-                    );
+                    // debug!(
+                    //     "uart - first write {=u8:x}, queue size {=usize}",
+                    //     c,
+                    //     tx_queue.len()
+                    // );
                     self.uart0.txd.write(|w| unsafe { w.txd().bits(c) });
                     Tx
                 } else {
@@ -55,11 +55,11 @@ impl Uart {
             Tx => {
                 if self.uart0.events_txdrdy.read().bits() != 0 {
                     if let Some(c) = tx_queue.dequeue() {
-                        debug!(
-                            "uart - write {=u8:x}, queue size {=usize}",
-                            c,
-                            tx_queue.len()
-                        );
+                        // debug!(
+                        //     "uart - write {=u8:x}, queue size {=usize}",
+                        //     c,
+                        //     tx_queue.len()
+                        // );
                         self.uart0.events_txdrdy.write(|w| unsafe { w.bits(0) });
                         self.uart0.txd.write(|w| unsafe { w.txd().bits(c) });
                     }
@@ -72,11 +72,11 @@ impl Uart {
             self.uart0.events_rxdrdy.write(|w| unsafe { w.bits(0) });
             let byte = self.uart0.rxd.read().bits() as u8;
             rx_queue.enqueue(byte);
-            debug!(
-                "uart - read {=u8:x}, queue size {=usize}",
-                byte,
-                rx_queue.len()
-            );
+            // debug!(
+            //     "uart - read {=u8:x}, queue size {=usize}",
+            //     byte,
+            //     rx_queue.len()
+            // );
         }
     }
 }
