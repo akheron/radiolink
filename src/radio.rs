@@ -465,7 +465,7 @@ impl Radio {
                 // The (now % 3) term adds some randomness to the retransmit interval.
                 // if now - since > 2 + 2u32.pow(tx_count) + (now % 3) {
                 if now - since > 2 + (now % 89) / 3 {
-                    if tx_count <= 6 {
+                    if tx_count <= 16 {
                         (
                             // Re-send ack too, because they might be waiting for it
                             if let RxState::Acked { id: ack_id } = rx_state {
