@@ -485,7 +485,6 @@ impl Radio {
                             "radio - no ack received for {=u8} after {=u32} transmits, giving up",
                             packet_data.id, tx_count
                         );
-                        panic!("no ack received");
                         (None, rx_state, TxState::Idle)
                     }
                 } else {
