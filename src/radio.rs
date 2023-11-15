@@ -278,7 +278,7 @@ impl Radio {
             RadioState::Uninitialized => RadioState::Uninitialized,
             RadioState::RxIdle => {
                 if self.radio.events_address.read().bits() != 0 {
-                    // debug!("radio - receiving at {=u32}", now);
+                    debug!("radio - receiving at {=u32}", now);
                     self.radio.events_address.write(|w| unsafe { w.bits(0) });
                     RadioState::Rx
                 } else {
@@ -292,7 +292,7 @@ impl Radio {
                         tx_state.debug();
                         packet.write(&mut self.packet);
 
-                        // debug!("radio - disable rx at {=u32}", now);
+                        debug!("radio - disable rx at {=u32}", now);
                         self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
                         RadioState::RxDisable
                     } else {
@@ -305,7 +305,7 @@ impl Radio {
                     self.radio.events_end.write(|w| unsafe { w.bits(0) });
                     if self.radio.crcstatus.read().crcstatus().is_crcok() {
                         // CRC ok
-                        // debug!("radio - crc ok at {=u32}", now);
+                        debug!("radio - crc ok at {=u32}", now);
                         if let Some(packet) = Packet::read(&self.packet) {
                             match packet {
                                 Packet::Ack(ack) => {
@@ -336,7 +336,7 @@ impl Radio {
                         debug!("radio - crc error");
                     }
                     self.radio.tasks_start.write(|w| unsafe { w.bits(1) });
-                    // debug!("radio - receive done - restarted rx at {=u32}", now);
+                    debug!("radio - receive done - restarted rx at {=u32}", now);
                     RadioState::RxIdle
                 } else {
                     RadioState::Rx
@@ -344,7 +344,7 @@ impl Radio {
             }
             RadioState::RxDisable => {
                 if self.radio.events_disabled.read().bits() != 0 {
-                    // debug!("radio - rx disabled at {=u32}", now);
+                    debug!("radio - rx disabled at {=u32}", now);
                     self.radio.events_disabled.write(|w| unsafe { w.bits(0) });
                     self.radio.tasks_txen.write(|w| unsafe { w.bits(1) });
                     RadioState::Tx
@@ -354,7 +354,7 @@ impl Radio {
             }
             RadioState::Tx => {
                 if self.radio.events_end.read().bits() != 0 {
-                    // debug!("radio - tx done at {=u32}", now);
+                    debug!("radio - tx done at {=u32}", now);
                     self.radio.events_address.write(|w| unsafe { w.bits(0) });
                     self.radio.events_end.write(|w| unsafe { w.bits(0) });
                     self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
@@ -365,7 +365,7 @@ impl Radio {
             }
             RadioState::TxDisable => {
                 if self.radio.events_disabled.read().bits() != 0 {
-                    // debug!("radio - tx disabled at {=u32}", now);
+                    debug!("radio - tx disabled at {=u32}", now);
                     self.radio.events_disabled.write(|w| unsafe { w.bits(0) });
                     self.radio.tasks_rxen.write(|w| unsafe { w.bits(1) });
                     RadioState::RxIdle
