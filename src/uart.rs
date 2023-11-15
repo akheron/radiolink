@@ -28,7 +28,7 @@ impl Uart {
 
         self.uart0.pseltxd.write(|w| unsafe { w.bits(tx_pin) });
         self.uart0.pselrxd.write(|w| unsafe { w.bits(rx_pin) });
-        self.uart0.baudrate.write(|w| w.baudrate().baud9600());
+        self.uart0.baudrate.write(|w| w.baudrate().baud19200());
         self.uart0.enable.write(|w| w.enable().enabled());
 
         self.uart0.tasks_startrx.write(|w| unsafe { w.bits(1) });
