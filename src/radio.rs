@@ -466,7 +466,12 @@ impl Radio {
                 if now - since > 2 + 2u32.pow(tx_count) + (now % 3) {
                     if tx_count <= 6 {
                         (
-                            Some(Packet::Data(packet_data)),
+                            // Re-send ack too, because they might be waiting for it
+                            if let RxState::Acked { id: ack_id } = rx_state {
+                                Some(Packet::Both(ack_id, packet_data))
+                            } else {
+                                Some(Packet::Data(packet_data))
+                            },
                             rx_state,
                             TxState::Sent {
                                 tx_count: tx_count + 1,
