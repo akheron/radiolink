@@ -1,5 +1,4 @@
 use defmt::debug;
-use heapless::spsc::Queue;
 use microbit::pac::{GPIO, UART0};
 
 #[derive(PartialEq, Eq)]
@@ -7,6 +6,7 @@ enum TxState {
     Idle,
     Tx,
 }
+use crate::queue::Queue;
 use TxState::*;
 
 pub struct Uart {
@@ -37,12 +37,7 @@ impl Uart {
         debug!("UART initialized");
     }
 
-    pub fn tick(
-        &mut self,
-        _now: u32,
-        tx_queue: &mut Queue<u8, 1024>,
-        rx_queue: &mut Queue<u8, 1024>,
-    ) {
+    pub fn tick(&mut self, _now: u32, tx_queue: &mut Queue, rx_queue: &mut Queue) {
         self.tx_state = match self.tx_state {
             Idle => {
                 if let Some(c) = tx_queue.dequeue() {
@@ -76,7 +71,7 @@ impl Uart {
         while self.uart0.events_rxdrdy.read().bits() != 0 {
             self.uart0.events_rxdrdy.write(|w| unsafe { w.bits(0) });
             let byte = self.uart0.rxd.read().bits() as u8;
-            rx_queue.enqueue(byte).unwrap();
+            rx_queue.enqueue(byte);
             debug!(
                 "uart - read {=u8:x}, queue size {=usize}",
                 byte,

@@ -1,5 +1,5 @@
+use crate::queue::Queue;
 use defmt::{debug, Format};
-use heapless::spsc::Queue;
 use microbit::pac::{CLOCK, RADIO};
 
 const MAX_DATA_SIZE: usize = 64;
@@ -77,7 +77,7 @@ struct PacketData {
 }
 
 impl PacketData {
-    fn from_queue(id: u8, queue: &mut Queue<u8, 1024>) -> Self {
+    fn from_queue(id: u8, queue: &mut Queue) -> Self {
         let mut data = [0; MAX_DATA_SIZE];
         let mut len = 0;
         while len < MAX_DATA_SIZE && !queue.is_empty() {
@@ -273,12 +273,7 @@ impl Radio {
         debug!("Radio initialized");
     }
 
-    pub fn tick(
-        &mut self,
-        now: u32,
-        tx_queue: &mut Queue<u8, 1024>,
-        rx_queue: &mut Queue<u8, 1024>,
-    ) {
+    pub fn tick(&mut self, now: u32, tx_queue: &mut Queue, rx_queue: &mut Queue) {
         self.radio_state = match self.radio_state {
             RadioState::Uninitialized => RadioState::Uninitialized,
             RadioState::RxIdle => {
@@ -399,12 +394,12 @@ impl Radio {
         }
     }
 
-    fn handle_rx_data(&mut self, packet_data: PacketData, rx_queue: &mut Queue<u8, 1024>) {
+    fn handle_rx_data(&mut self, packet_data: PacketData, rx_queue: &mut Queue) {
         match self.rx_state {
             RxState::Initial => {
                 // This is the first received data packet
                 for &byte in packet_data.iter() {
-                    rx_queue.enqueue(byte).unwrap();
+                    rx_queue.enqueue(byte);
                 }
                 self.rx_state = RxState::NeedsAck { id: packet_data.id };
             }
@@ -412,7 +407,7 @@ impl Radio {
                 if packet_data.id != last_acked_id {
                     // Write data to rx queue only if it's a new packet
                     for &byte in packet_data.iter() {
-                        rx_queue.enqueue(byte).unwrap();
+                        rx_queue.enqueue(byte);
                     }
                 } else {
                     debug!(
@@ -435,7 +430,7 @@ impl Radio {
     fn assemble_packet(
         &mut self,
         now: u32,
-        tx_queue: &mut Queue<u8, 1024>,
+        tx_queue: &mut Queue,
     ) -> (Option<Packet>, RxState, TxState) {
         match (self.rx_state, self.tx_state) {
             (
