@@ -2,9 +2,8 @@ use crate::queue::Queue;
 use defmt::{debug, Format};
 use microbit::pac::{CLOCK, RADIO};
 
-const MAX_DATA_SIZE: usize = 64;
-const MIN_PACKET_SIZE: usize = 3;
-const MAX_PACKET_SIZE: usize = MAX_DATA_SIZE + 4;
+const MIN_PAYLOAD_SIZE: usize = 1;
+const MAX_PAYLOAD_SIZE: usize = 27;
 
 #[derive(Clone, Copy, PartialEq, Eq, Format)]
 enum RadioState {
@@ -80,14 +79,14 @@ impl TxState {
 struct PacketData {
     id: u8,
     data_len: u8,
-    data: [u8; MAX_DATA_SIZE],
+    data: [u8; MAX_PAYLOAD_SIZE],
 }
 
 impl PacketData {
     fn from_queue(id: u8, queue: &mut Queue) -> Self {
-        let mut data = [0; MAX_DATA_SIZE];
+        let mut data = [0; MAX_PAYLOAD_SIZE];
         let mut len = 0;
-        while len < MAX_DATA_SIZE && !queue.is_empty() {
+        while len < MAX_PAYLOAD_SIZE && !queue.is_empty() {
             data[len] = queue.dequeue().unwrap();
             len += 1;
         }
@@ -109,34 +108,34 @@ enum Packet {
     Both(u8, PacketData),
 }
 
+const S0: usize = 0;
+const LEN: usize = 1;
+const S1: usize = 2;
+const PAYLOAD: usize = 3;
+
 impl Packet {
     fn read(source: &[u8]) -> Option<Self> {
-        let len = source[0];
-        if (len as usize) < MIN_PACKET_SIZE || (len as usize) > MAX_PACKET_SIZE {
+        if (source[LEN] as usize) < MIN_PAYLOAD_SIZE || (source[LEN] as usize) > MAX_PAYLOAD_SIZE {
             None
         } else {
-            match source[1] {
-                b'A' => Some(Self::Ack(source[2])),
+            match source[S0] {
+                b'A' => Some(Self::Ack(source[PAYLOAD])),
                 b'D' => {
-                    let mut data = [0; MAX_DATA_SIZE];
-                    data[..(len as usize - 3)].copy_from_slice(&source[3..(len as usize)]);
-                    Some(Self::Data(PacketData {
-                        id: source[2],
-                        data_len: len - 3,
-                        data,
-                    }))
+                    let data_len = source[LEN] - 1;
+                    let id = source[PAYLOAD];
+                    let mut data = [0; MAX_PAYLOAD_SIZE];
+                    data[..(data_len as usize)]
+                        .copy_from_slice(&source[(PAYLOAD + 1)..(data_len as usize + PAYLOAD + 1)]);
+                    Some(Self::Data(PacketData { id, data_len, data }))
                 }
                 b'X' => {
-                    let mut data = [0; MAX_DATA_SIZE];
-                    data[..(len as usize - 4)].copy_from_slice(&source[4..(len as usize)]);
-                    Some(Self::Both(
-                        source[2],
-                        PacketData {
-                            id: source[3],
-                            data_len: len - 4,
-                            data,
-                        },
-                    ))
+                    let data_len = source[LEN] - 2;
+                    let ack_id = source[PAYLOAD];
+                    let id = source[PAYLOAD + 1];
+                    let mut data = [0; MAX_PAYLOAD_SIZE];
+                    data[..(data_len as usize)]
+                        .copy_from_slice(&source[(PAYLOAD + 2)..(PAYLOAD + 2 + data_len as usize)]);
+                    Some(Self::Both(ack_id, PacketData { id, data_len, data }))
                 }
                 _ => None,
             }
@@ -146,22 +145,27 @@ impl Packet {
     fn write(&self, target: &mut [u8]) {
         match self {
             Packet::Ack(ack) => {
-                target[0] = 3;
-                target[1] = b'A';
-                target[2] = *ack;
+                target[S0] = b'A';
+                target[LEN] = 1;
+                target[S1] = 0;
+                target[PAYLOAD] = *ack;
             }
             Packet::Data(PacketData { id, data_len, data }) => {
-                target[0] = data_len + 3;
-                target[1] = b'D';
-                target[2] = *id;
-                target[3..(*data_len as usize + 3)].copy_from_slice(&data[0..*data_len as usize]);
+                target[S0] = b'D';
+                target[LEN] = *data_len + 1;
+                target[S1] = 0;
+                target[PAYLOAD] = *id;
+                target[(PAYLOAD + 1)..(PAYLOAD + 1 + *data_len as usize)]
+                    .copy_from_slice(&data[0..*data_len as usize]);
             }
             Packet::Both(ack_id, PacketData { id, data_len, data }) => {
-                target[0] = data_len + 4;
-                target[1] = b'X';
-                target[2] = *ack_id;
-                target[3] = *id;
-                target[4..(*data_len as usize + 4)].copy_from_slice(&data[0..*data_len as usize]);
+                target[S0] = b'X';
+                target[LEN] = *data_len + 2;
+                target[S1] = 0;
+                target[PAYLOAD] = *ack_id;
+                target[PAYLOAD + 1] = *id;
+                target[(PAYLOAD + 2)..(PAYLOAD + 2 + *data_len as usize)]
+                    .copy_from_slice(&data[0..*data_len as usize]);
             }
         }
     }
@@ -209,7 +213,7 @@ impl Packet {
 
 pub struct Radio {
     radio: RADIO,
-    packet: [u8; MAX_PACKET_SIZE],
+    packet: [u8; MAX_PAYLOAD_SIZE],
     next_packet_id: u8,
     radio_state: RadioState,
     connection_state: ConnectionState,
@@ -221,7 +225,7 @@ impl Radio {
     pub fn new(radio: RADIO) -> Self {
         Self {
             radio,
-            packet: [0; MAX_PACKET_SIZE],
+            packet: [0; MAX_PAYLOAD_SIZE],
             next_packet_id: 0,
             radio_state: RadioState::Uninitialized,
             connection_state: ConnectionState::Probing,
@@ -244,26 +248,26 @@ impl Radio {
         self.radio.txaddress.write(|w| unsafe { w.bits(0) }); // Transmit on logical address 0
         self.radio.rxaddresses.write(|w| w.addr0().enabled()); // Enable reception on logical address 0 only
         self.radio.pcnf0.write(|w| unsafe {
-            w.lflen()
-                .bits(8) // 8-bit length field
-                .s0len()
-                .bit(false) // No S0 field
+            w.s0len()
+                .bit(true) // S0 field => CCM header
+                .lflen()
+                .bits(5) // 5-bit length field
                 .s1len()
-                .bits(0) // No S1 field
+                .bits(3) // 3-bit RFU field
         });
         self.radio.pcnf1.write(|w| unsafe {
             w.maxlen()
-                .bits((MAX_PACKET_SIZE - 1) as u8) // Maximum payload
+                .bits((MAX_PAYLOAD_SIZE - 1) as u8) // Maximum payload
                 .statlen()
                 .bits(0)
                 .balen()
-                .bits(4) // 4-byte base address length
+                .bits(3) // 4-byte base address length
                 .endian()
                 .little() // Little endian payload
                 .whiteen()
                 .enabled() // Enable packet whitening
         });
-        self.radio.crccnf.write(|w| w.len().two()); // 16-bit CRC
+        self.radio.crccnf.write(|w| w.len().three()); // 24-bit CRC
         self.radio.crcinit.write(|w| unsafe { w.bits(0xFFFF) }); // CRC initial value
         self.radio.crcpoly.write(|w| unsafe { w.bits(0x11021) }); // CRC polynomial
         self.radio.datawhiteiv.write(|w| unsafe { w.bits(0x18) }); // Initial value for the data whitening algorithm
@@ -335,10 +339,7 @@ impl Radio {
                             self.rx_state.debug();
                             self.tx_state.debug();
                         } else {
-                            debug!(
-                                "radio - received malformed packet {=u8} {=u8} {=u8} {=u8}",
-                                self.packet[0], self.packet[1], self.packet[2], self.packet[3]
-                            );
+                            debug!("radio - received malformed packet {=[u8]:x}", self.packet);
                         }
                     } else {
                         // CRC error
