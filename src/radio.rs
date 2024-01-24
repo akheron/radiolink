@@ -17,6 +17,13 @@ enum RadioState {
 }
 
 #[derive(Clone, Copy)]
+enum ConnectionState {
+    Probing,
+    Client,
+    Server,
+}
+
+#[derive(Clone, Copy)]
 enum RxState {
     Initial,
     NeedsAck { id: u8 },
@@ -205,6 +212,7 @@ pub struct Radio {
     packet: [u8; MAX_PACKET_SIZE],
     next_packet_id: u8,
     radio_state: RadioState,
+    connection_state: ConnectionState,
     rx_state: RxState,
     tx_state: TxState,
 }
@@ -216,6 +224,7 @@ impl Radio {
             packet: [0; MAX_PACKET_SIZE],
             next_packet_id: 0,
             radio_state: RadioState::Uninitialized,
+            connection_state: ConnectionState::Probing,
             rx_state: RxState::Initial,
             tx_state: TxState::Idle,
         }
@@ -229,7 +238,7 @@ impl Radio {
         // Configure radio to match microbit defaults
         self.radio.txpower.write(|w| w.txpower().pos4d_bm()); // +4 dBm
         self.radio.frequency.write(|w| unsafe { w.bits(7) }); // Default channel: 7
-        self.radio.mode.write(|w| w.mode().nrf_1mbit()); // Default data rate: 1 Mbps
+        self.radio.mode.write(|w| w.mode().ble_1mbit()); // Data rate: 1 Mbps (BLE)
         self.radio.base0.write(|w| unsafe { w.bits(0x75626974) }); // "uBit"
         self.radio.prefix0.write(|w| unsafe { w.bits(0) });
         self.radio.txaddress.write(|w| unsafe { w.bits(0) }); // Transmit on logical address 0

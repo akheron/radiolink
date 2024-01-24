@@ -5,7 +5,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{self, Ordering};
 
 use cortex_m_rt::entry;
-use defmt::debug;
+use defmt::{debug, info};
 use defmt_rtt as _; // global logger
 use microbit::pac::Peripherals;
 
@@ -16,6 +16,7 @@ use crate::uart::Uart;
 
 mod queue;
 mod radio;
+mod rng;
 mod rtc;
 mod uart;
 
@@ -30,6 +31,9 @@ const RX_PIN: u32 = 3;
 #[entry]
 fn main() -> ! {
     let p = Peripherals::take().unwrap();
+
+    let rng = rng::Rng::new(p.RNG);
+    rng.init();
 
     let mut rtc = Rtc::new(p.RTC0);
     rtc.init(&p.CLOCK);
