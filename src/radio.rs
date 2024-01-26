@@ -1,9 +1,10 @@
 use crate::queue::Queue;
 use defmt::{debug, Format};
-use microbit::pac::{CLOCK, RADIO};
+use microbit::pac::{CCM, CLOCK, PPI, RADIO};
 
 const MIN_PAYLOAD_SIZE: usize = 1;
 const MAX_PAYLOAD_SIZE: usize = 27;
+const MAX_PACKET_SIZE: usize = MAX_PAYLOAD_SIZE + 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Format)]
 enum RadioState {
@@ -213,7 +214,12 @@ impl Packet {
 
 pub struct Radio {
     radio: RADIO,
+    ccm: CCM,
+    ppi: PPI,
     packet: [u8; MAX_PAYLOAD_SIZE],
+    plaintext: [u8; MAX_PAYLOAD_SIZE],
+    ccm_config: [u8; 33],
+    ccm_scratch: [u8; 16 + MAX_PACKET_SIZE],
     next_packet_id: u8,
     radio_state: RadioState,
     connection_state: ConnectionState,
@@ -222,10 +228,20 @@ pub struct Radio {
 }
 
 impl Radio {
-    pub fn new(radio: RADIO) -> Self {
+    pub fn new(radio: RADIO, ccm: CCM, ppi: PPI) -> Self {
         Self {
             radio,
+            ccm,
+            ppi,
             packet: [0; MAX_PAYLOAD_SIZE],
+            plaintext: [0; MAX_PAYLOAD_SIZE],
+            ccm_config: [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, // AES key
+                0, 0, 0, 0, 0, 0, 0, 0, // Counter
+                0, // Direction
+                7, 6, 5, 4, 3, 2, 1, 0, // IV
+            ],
+            ccm_scratch: [0; 16 + MAX_PACKET_SIZE],
             next_packet_id: 0,
             radio_state: RadioState::Uninitialized,
             connection_state: ConnectionState::Probing,
@@ -238,6 +254,19 @@ impl Radio {
         clock.events_hfclkstarted.write(|w| unsafe { w.bits(0) });
         clock.tasks_hfclkstart.write(|w| unsafe { w.bits(1) });
         while clock.events_hfclkstarted.read().bits() == 0 {}
+        debug!("High frequency clock started");
+
+        // ppi: enable radio READY -> ccm KSGEN (ch24)
+        self.ppi.chenset.write(|w| w.ch24().set());
+
+        self.ccm
+            .cnfptr
+            .write(|w| unsafe { w.bits(self.ccm_config.as_ptr() as u32) });
+        self.ccm
+            .scratchptr
+            .write(|w| unsafe { w.bits(self.ccm_scratch.as_ptr() as u32) });
+        self.ccm.enable.write(|w| w.enable().enabled());
+        debug!("CCM initialized");
 
         // Configure radio to match microbit defaults
         self.radio.txpower.write(|w| w.txpower().pos4d_bm()); // +4 dBm
@@ -272,14 +301,25 @@ impl Radio {
         self.radio.crcpoly.write(|w| unsafe { w.bits(0x11021) }); // CRC polynomial
         self.radio.datawhiteiv.write(|w| unsafe { w.bits(0x18) }); // Initial value for the data whitening algorithm
 
-        let packet_ptr = self.packet.as_ptr() as u32;
         self.radio
             .packetptr
-            .write(|w| unsafe { w.bits(packet_ptr) });
+            .write(|w| unsafe { w.bits(self.packet.as_ptr() as u32) });
 
         // Shortcut READY -> START
         self.radio.shorts.write(|w| w.ready_start().enabled());
 
+        // CCM on-the-fly decryption
+        self.ccm.mode.write(|w| w.mode().decryption());
+        self.ccm
+            .inptr
+            .write(|w| unsafe { w.bits(self.packet.as_ptr() as u32) });
+        self.ccm
+            .outptr
+            .write(|w| unsafe { w.bits(self.plaintext.as_ptr() as u32) });
+        self.ccm.shorts.write(|w| w.endksgen_crypt().disabled()); // enable shortcut ENDKSGEN -> CRYPT
+        self.ppi.chenset.write(|w| w.ch25().set()); // enable radio event ADDRESS -> ccm task CRYPT (ch25)
+
+        // Enable radio RX
         self.radio.tasks_rxen.write(|w| unsafe { w.bits(1) });
         self.radio_state = RadioState::RxIdle;
 
@@ -303,7 +343,7 @@ impl Radio {
                         packet.debug_assembled();
                         rx_state.debug();
                         tx_state.debug();
-                        packet.write(&mut self.packet);
+                        packet.write(&mut self.plaintext);
 
                         debug!("radio - disable rx at {=u32}", now);
                         self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
@@ -316,14 +356,28 @@ impl Radio {
             RadioState::Rx => {
                 if self.radio.events_end.read().bits() != 0 {
                     self.radio.events_end.write(|w| unsafe { w.bits(0) });
-                    if self.radio.crcstatus.read().crcstatus().is_crcok() {
-                        // CRC ok
-                        debug!("radio - crc ok at {=u32}", now);
-                        if let Some(packet) = Packet::read(&self.packet) {
+                    debug!("radio - received packet: {=[u8]:x}", self.packet);
+                    debug!("radio - received plaintext: {=[u8]:x}", self.plaintext);
+                    debug!(
+                        "radio - crc ok: {=bool} at {=u32}",
+                        self.radio.crcstatus.read().crcstatus().is_crcok(),
+                        now
+                    );
+                    debug!(
+                        "radio - mic ok: {=bool} at {=u32}",
+                        self.ccm.micstatus.read().micstatus().bits(),
+                        now
+                    );
+                    if self.radio.crcstatus.read().crcstatus().is_crcok()
+                        && self.ccm.micstatus.read().micstatus().bits()
+                    {
+                        // CRC & MIC ok
+                        if let Some(packet) = Packet::read(&self.plaintext) {
                             match packet {
                                 Packet::Ack(ack) => {
                                     // debug!("radio - received ack: {=u8}", ack);
                                     self.handle_rx_ack(ack);
+                                    self.ccm_config[16] += 1; // increase counter
                                 }
                                 Packet::Data(packet_data) => {
                                     // debug!("radio - received data: {=u8}", packet_data.id);
@@ -342,8 +396,8 @@ impl Radio {
                             debug!("radio - received malformed packet {=[u8]:x}", self.packet);
                         }
                     } else {
-                        // CRC error
-                        debug!("radio - crc error");
+                        // CRC or MIC error
+                        debug!("radio - crc or mic error");
                     }
                     self.radio.tasks_start.write(|w| unsafe { w.bits(1) });
                     debug!("radio - receive done - restarted rx at {=u32}", now);
@@ -356,6 +410,18 @@ impl Radio {
                 if self.radio.events_disabled.read().bits() != 0 {
                     debug!("radio - rx disabled at {=u32}", now);
                     self.radio.events_disabled.write(|w| unsafe { w.bits(0) });
+
+                    // CCM on-the-fly encryption
+                    self.ccm.mode.write(|w| w.mode().encryption());
+                    self.ccm
+                        .inptr
+                        .write(|w| unsafe { w.bits(self.plaintext.as_ptr() as u32) });
+                    self.ccm
+                        .outptr
+                        .write(|w| unsafe { w.bits(self.packet.as_ptr() as u32) });
+                    self.ccm.shorts.write(|w| w.endksgen_crypt().enabled()); // enable shortcut ENDKSGEN -> CRYPT
+                    self.ppi.chenclr.write(|w| w.ch25().clear()); // disable ppi radio ADDRESS -> ccm CRYPT (ch25)
+
                     self.radio.tasks_txen.write(|w| unsafe { w.bits(1) });
                     RadioState::Tx
                 } else {
@@ -365,9 +431,18 @@ impl Radio {
             RadioState::Tx => {
                 if self.radio.events_end.read().bits() != 0 {
                     debug!("radio - tx done at {=u32}", now);
+                    debug!("radio - sent plaintext: {=[u8]:x}", self.plaintext);
+                    debug!("radio - sent packet: {=[u8]:x}", self.packet);
                     self.radio.events_address.write(|w| unsafe { w.bits(0) });
                     self.radio.events_end.write(|w| unsafe { w.bits(0) });
                     self.radio.tasks_disable.write(|w| unsafe { w.bits(1) });
+
+                    // If ack was sent, increase counter
+                    // TODO: it's wasteful to parse the sent plaintext again
+                    if let Some(Packet::Ack(_)) = Packet::read(&self.plaintext) {
+                        self.ccm_config[16] += 1;
+                    }
+
                     RadioState::TxDisable
                 } else {
                     RadioState::Tx
@@ -377,6 +452,19 @@ impl Radio {
                 if self.radio.events_disabled.read().bits() != 0 {
                     debug!("radio - tx disabled at {=u32}", now);
                     self.radio.events_disabled.write(|w| unsafe { w.bits(0) });
+
+                    // CCM on-the-fly decryption
+                    self.ccm.mode.write(|w| w.mode().decryption());
+                    self.ccm
+                        .inptr
+                        .write(|w| unsafe { w.bits(self.packet.as_ptr() as u32) });
+                    self.ccm
+                        .outptr
+                        .write(|w| unsafe { w.bits(self.plaintext.as_ptr() as u32) });
+                    self.ccm.shorts.write(|w| w.endksgen_crypt().disabled()); // disable shortcut ENDKSGEN -> CRYPT
+                    self.ppi.chenset.write(|w| w.ch25().set()); // enable ppi radio ADDRESS -> ccm CRYPT (ch25)
+
+                    // Enable radio RX
                     self.radio.tasks_rxen.write(|w| unsafe { w.bits(1) });
                     RadioState::RxIdle
                 } else {

@@ -41,7 +41,7 @@ fn main() -> ! {
     let mut uart = Uart::new(p.UART0);
     uart.init(&p.GPIO, TX_PIN, RX_PIN);
 
-    let mut radio = Radio::new(p.RADIO);
+    let mut radio = Radio::new(p.RADIO, p.CCM, p.PPI);
     radio.init(&p.CLOCK);
 
     let mut uart_to_radio = Queue::new();
