@@ -1,24 +1,27 @@
-use defmt::debug;
-use microbit::pac::{GPIO, UART0};
+use defmt::{info, trace, warn};
+use heapless::spsc::{Consumer, Producer, Queue};
+use nrf51_hal::pac::{GPIO, UART0};
 
-#[derive(PartialEq, Eq)]
-enum TxState {
-    Idle,
-    Tx,
-}
-use crate::queue::Queue;
-use TxState::*;
+const QUEUE_SIZE: usize = 2048;
+
+pub type QueueType = Queue<u8, QUEUE_SIZE>;
+pub type ProducerType = Producer<'static, u8, QUEUE_SIZE>;
+pub type ConsumerType = Consumer<'static, u8, QUEUE_SIZE>;
 
 pub struct Uart {
     uart0: UART0,
-    tx_state: TxState,
+    txing: bool,
+    tx: ConsumerType,
+    rx: ProducerType,
 }
 
 impl Uart {
-    pub fn new(uart0: UART0) -> Self {
+    pub fn new(uart0: UART0, tx: ConsumerType, rx: ProducerType) -> Self {
         Self {
             uart0,
-            tx_state: Idle,
+            tx,
+            rx,
+            txing: false,
         }
     }
 
@@ -26,57 +29,49 @@ impl Uart {
         gpio.pin_cnf[tx_pin as usize].write(|w| w.pull().pullup().dir().output());
         gpio.pin_cnf[rx_pin as usize].write(|w| w.pull().disabled().dir().input());
 
-        self.uart0.pseltxd.write(|w| unsafe { w.bits(tx_pin) });
-        self.uart0.pselrxd.write(|w| unsafe { w.bits(rx_pin) });
-        self.uart0.baudrate.write(|w| w.baudrate().baud38400());
-        self.uart0.enable.write(|w| w.enable().enabled());
+        let uart0 = &self.uart0;
+        uart0.pseltxd.write(|w| unsafe { w.bits(tx_pin) });
+        uart0.pselrxd.write(|w| unsafe { w.bits(rx_pin) });
+        uart0.baudrate.write(|w| w.baudrate().baud38400());
+        uart0
+            .intenset
+            .write(|w| w.txdrdy().bit(true).rxdrdy().bit(true));
+        uart0.enable.write(|w| w.enable().enabled());
 
-        self.uart0.tasks_startrx.write(|w| unsafe { w.bits(1) });
-        self.uart0.tasks_starttx.write(|w| unsafe { w.bits(1) });
+        uart0.tasks_startrx.write(|w| unsafe { w.bits(1) });
+        uart0.tasks_starttx.write(|w| unsafe { w.bits(1) });
 
-        debug!("UART initialized");
+        info!("UART initialized");
     }
 
-    pub fn tick(&mut self, _now: u32, tx_queue: &mut Queue, rx_queue: &mut Queue) {
-        self.tx_state = match self.tx_state {
-            Idle => {
-                if let Some(c) = tx_queue.dequeue() {
-                    // debug!(
-                    //     "uart - first write {=u8:x}, queue size {=usize}",
-                    //     c,
-                    //     tx_queue.len()
-                    // );
-                    self.uart0.txd.write(|w| unsafe { w.txd().bits(c) });
-                    Tx
-                } else {
-                    Idle
-                }
+    /// Returns true if data was written to the RX queue
+    pub fn handle_interrupt(&mut self) -> bool {
+        let uart0 = &self.uart0;
+        if uart0.events_txdrdy.read().bits() != 0 {
+            uart0.events_txdrdy.write(|w| unsafe { w.bits(0) });
+            trace!("uart: txdrdy");
+            self.txing = false;
+        }
+        if !self.txing {
+            trace!("uart: try_recv");
+            if let Some(c) = self.tx.dequeue() {
+                trace!("tx: {=u8:x}", c);
+                uart0.txd.write(|w| unsafe { w.txd().bits(c) });
+                self.txing = true;
             }
-            Tx => {
-                if self.uart0.events_txdrdy.read().bits() != 0 {
-                    if let Some(c) = tx_queue.dequeue() {
-                        // debug!(
-                        //     "uart - write {=u8:x}, queue size {=usize}",
-                        //     c,
-                        //     tx_queue.len()
-                        // );
-                        self.uart0.events_txdrdy.write(|w| unsafe { w.bits(0) });
-                        self.uart0.txd.write(|w| unsafe { w.txd().bits(c) });
-                    }
-                }
-                Tx
+        }
+        if uart0.events_rxdrdy.read().bits() != 0 {
+            uart0.events_rxdrdy.write(|w| unsafe { w.bits(0) });
+            trace!("uart: rxdrdy");
+            let byte = uart0.rxd.read().bits() as u8;
+            trace!("uart: rx {=u8:x}", byte);
+            if self.rx.enqueue(byte).is_err() {
+                warn!("uart: rx queue full");
             }
-        };
-
-        while self.uart0.events_rxdrdy.read().bits() != 0 {
-            self.uart0.events_rxdrdy.write(|w| unsafe { w.bits(0) });
-            let byte = self.uart0.rxd.read().bits() as u8;
-            rx_queue.enqueue(byte);
-            // debug!(
-            //     "uart - read {=u8:x}, queue size {=usize}",
-            //     byte,
-            //     rx_queue.len()
-            // );
+            trace!("uart: enqueued {=u8:x}", byte);
+            true
+        } else {
+            false
         }
     }
 }
